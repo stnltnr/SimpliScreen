@@ -390,14 +390,16 @@ def chunk_text(text, max_chars=1200, overlap=150):
     return chunks
 
 def clean_for_prompt(text):
-    """Strip characters that break JSON in Gemini's response."""
-    text = text.replace("\\", " ").replace("\r", " ").replace("\n", " ")
-    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', " ", text)   # control chars
-    text = text.replace('"', "'")                          # avoid quote confusion
+    """Strip binary/non-printable characters that cause 'unreadable evidence' in Gemini."""
+    if not isinstance(text, str):
+        return ""
+    # Keep only printable ASCII + common unicode letters — removes binary garbage
+    text = "".join(c if (ord(c) >= 32 and ord(c) != 127) or c in "\t" else " " for c in text)
+    text = text.replace("\\", " ").replace('"', "'")
     return re.sub(r"\s+", " ", text).strip()
 
 def parse_json_robust(raw):
-    """Try JSON parse with progressive fallback repair."""
+    """Try JSON parse with 4-stage progressive repair."""
     if not raw:
         return None
     # 1. Direct parse
@@ -405,14 +407,21 @@ def parse_json_robust(raw):
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    # 2. Extract first {...} block
+    # 2. Trim to last valid closing brace (handles truncated responses)
+    last_brace = raw.rfind("}")
+    if last_brace != -1:
+        try:
+            return json.loads(raw[:last_brace + 1])
+        except json.JSONDecodeError:
+            pass
+    # 3. Extract first {...} block
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
         try:
             return json.loads(m.group())
         except json.JSONDecodeError:
             pass
-    # 3. Fix bad escape sequences then retry
+    # 4. Fix bad escape sequences then retry
     cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", raw)
     try:
         return json.loads(cleaned)
@@ -481,39 +490,53 @@ Return ONLY valid JSON:
     prompt = "\n".join(parts)
 
     def call():
-        raw = client.models.generate_content(
+        response = client.models.generate_content(
             model=MODEL_NAME, contents=prompt,
             config=genai.types.GenerateContentConfig(
                 temperature=0.2,
                 response_mime_type="application/json",
-                max_output_tokens=8192,   # prevents cut-off / unterminated strings
+                max_output_tokens=8192,
             )
-        ).text
+        )
+        raw = response.text if response and response.text else None
+        if not raw:
+            raise ValueError("Gemini returned empty response")
         result = parse_json_robust(raw)
         if result is None:
-            raise ValueError(f"Could not parse Gemini JSON response: {raw[:200]}")
+            raise ValueError(f"JSON_PARSE_FAILED: {raw[:300]}")
         return result
+
+    def empty_result(note):
+        return {cat: {"has_service": False, "confidence": 0.0, "evidence": [], "notes": note}
+                for cat in categories}
 
     for attempt in range(5):
         try:
             return call()
         except Exception as e:
             err = str(e)
+            # Daily quota — abort entire run
+            if ("RESOURCE_EXHAUSTED" in err or "429" in err) and _is_daily_quota_error(err):
+                _daily_quota_exhausted = True
+                raise RuntimeError(f"DAILY_QUOTA_EXHAUSTED: {err}") from e
+            # Rate limit (per-minute) — wait and retry
             if "RESOURCE_EXHAUSTED" in err or "429" in err:
-                if _is_daily_quota_error(err):
-                    _daily_quota_exhausted = True
-                    raise RuntimeError(f"DAILY_QUOTA_EXHAUSTED: {err}") from e
                 m = re.search(r"retryDelay.*?(\d+)s", err)
                 wait = max(int(m.group(1)) + 5 if m else 0, 65 * (2 ** attempt))
                 time.sleep(wait)
-            elif "Could not parse" in err and attempt < 4:
-                # Bad JSON — retry once with a smaller prompt (fewer snippets)
-                time.sleep(2)
                 continue
-            else:
-                return {cat: {"has_service": False, "confidence": 0.0, "evidence": [], "notes": f"Model error: {e}"} for cat in categories}
+            # Server errors (500/503) — short wait and retry
+            if "500" in err or "503" in err or "UNAVAILABLE" in err or "INTERNAL" in err:
+                time.sleep(30 * (attempt + 1))
+                continue
+            # JSON parse failed — retry once immediately (model sometimes fixes itself)
+            if "JSON_PARSE_FAILED" in err and attempt < 3:
+                time.sleep(3)
+                continue
+            # Any other error — fail immediately, don't waste retries
+            return empty_result(f"Model error: {err[:150]}")
 
-    return {cat: {"has_service": False, "confidence": 0.0, "evidence": [], "notes": "Max retries exceeded"} for cat in categories}
+    return empty_result("Max retries exceeded")
 
 # ---------------- Parallel Classify ----------------
 def classify_batch_parallel(url_rows, ws, wb, categories, category_positions,
