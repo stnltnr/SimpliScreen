@@ -219,12 +219,8 @@ def fetch_page(url):
             return None, None, str(e)[:80]
     return None, None, "Failed after 2 attempts"
 
-def fetch_ddg_search(domain):
-    """
-    Search DuckDuckGo for site:domain to get rendered text that JS sites hide.
-    Returns (text, None) or (None, error).
-    """
-    query = f"site:{domain} services capabilities solutions consulting"
+def _ddg_query(query: str) -> str:
+    """Run one DuckDuckGo HTML search and return all snippet text."""
     search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
     try:
         headers = dict(BROWSER_HEADERS)
@@ -233,15 +229,41 @@ def fetch_ddg_search(domain):
             r = s.get(search_url)
             r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        snippets = []
-        for result in soup.select(".result__snippet, .result__body"):
-            t = result.get_text(" ", strip=True)
-            if t and domain.split(".")[0].lower() in r.text.lower():
-                snippets.append(t)
-        text = " ".join(snippets[:10])
-        return (text, None) if len(text) > 100 else (None, "DDG: no relevant snippets")
-    except Exception as e:
-        return None, f"DDG search failed: {e}"
+        parts = []
+        for el in soup.select(".result__snippet, .result__title, .result__url"):
+            t = el.get_text(" ", strip=True)
+            if t:
+                parts.append(t)
+        return " ".join(parts)
+    except Exception:
+        return ""
+
+def fetch_ddg_search(domain, company_name=""):
+    """
+    Run 3 targeted DDG searches per company to maximise content for JS/SPA sites:
+    1. site:domain (all indexed pages)
+    2. company name + pharma/biotech service keywords
+    3. company name + market access / pricing keywords
+    Returns merged text as a single page entry.
+    """
+    bare = domain.lstrip("www.")
+    name = company_name or bare.split(".")[0].replace("-", " ")
+
+    queries = [
+        f"site:{bare}",
+        f'"{name}" market access HEOR pricing reimbursement consulting services',
+        f'"{name}" payer strategy launch sequencing government affairs biotech pharma',
+    ]
+
+    all_text = []
+    for q in queries:
+        t = _ddg_query(q)
+        if t:
+            all_text.append(t)
+        time.sleep(0.5)   # be polite to DDG
+
+    combined = " ".join(all_text)
+    return (combined[:MAX_TEXT_PER_PAGE_CHARS], None) if len(combined) > 100 else (None, "DDG: no results")
 
 def fetch_google_cache(url):
     cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{quote_plus(url)}&hl=en"
@@ -291,7 +313,7 @@ def get_links(html, base_url):
             links.append(absu.split("#")[0])
     return list(dict.fromkeys(links))
 
-def crawl_site(start_url, max_pages=10):
+def crawl_site(start_url, max_pages=10, company_name=""):
     """
     Fast, bounded crawl with hard limits:
     1. Fetch homepage + top 4 priority subpages directly (max 5 seeds)
@@ -349,9 +371,9 @@ def crawl_site(start_url, max_pages=10):
 
         time.sleep(random.uniform(0.15, 0.4))
 
-    # Always supplement with DDG — gets rendered JS content + indexed descriptions
+    # Always supplement with DDG (3 queries) — gets rendered JS content
     domain = urlparse(start_url).netloc.lstrip("www.")
-    ddg_text, _ = fetch_ddg_search(domain)
+    ddg_text, _ = fetch_ddg_search(domain, company_name=company_name)
     if ddg_text:
         pages.append({"url": f"[DDG] {domain}", "text": ddg_text[:MAX_TEXT_PER_PAGE_CHARS]})
 
@@ -573,7 +595,8 @@ def classify_batch_parallel(url_rows, ws, wb, categories, category_positions,
 
     def do_crawl(args):
         i, row_idx, url_val = args
-        return i, url_val, crawl_site(url_val, max_pages=max_pages)
+        return i, url_val, crawl_site(url_val, max_pages=max_pages,
+                                       company_name=company_names.get(url_val, ""))
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         futures = {
