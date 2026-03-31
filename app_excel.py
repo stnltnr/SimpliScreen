@@ -68,7 +68,7 @@ BROWSER_HEADERS = {
 MAX_PAGES_DEFAULT = 40
 REQUEST_TIMEOUT = 20.0
 MAX_TEXT_PER_PAGE_CHARS = 15000
-TOP_SNIPPETS_PER_CATEGORY = 6
+TOP_SNIPPETS_PER_CATEGORY = 3  # reduced from 6 — fewer snippets = smaller output = no truncation
 THRESHOLD_DEFAULT = 0.6
 MAX_PARALLEL_COMPANIES_DEFAULT = 4
 
@@ -370,13 +370,44 @@ def chunk_text(text, max_chars=1200, overlap=150):
             break
     return chunks
 
+def clean_for_prompt(text):
+    """Strip characters that break JSON in Gemini's response."""
+    text = text.replace("\\", " ").replace("\r", " ").replace("\n", " ")
+    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', " ", text)   # control chars
+    text = text.replace('"', "'")                          # avoid quote confusion
+    return re.sub(r"\s+", " ", text).strip()
+
+def parse_json_robust(raw):
+    """Try JSON parse with progressive fallback repair."""
+    if not raw:
+        return None
+    # 1. Direct parse
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    # 2. Extract first {...} block
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    # 3. Fix bad escape sequences then retry
+    cleaned = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", raw)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    return None
+
 def build_snippets(pages):
     snippets = []
     for p in pages:
         for ch in chunk_text(p["text"]):
             if len(ch) >= 200:
-                snippets.append({"url": p["url"], "text": ch})
-    return snippets[:500]
+                snippets.append({"url": p["url"], "text": clean_for_prompt(ch)})
+    return snippets[:300]  # reduced from 500 to keep prompts manageable
 
 def rank_snippets_for_category(snippets, category):
     terms = re.findall(r"[a-z0-9]+", category.lower())
@@ -431,10 +462,18 @@ Return ONLY valid JSON:
     prompt = "\n".join(parts)
 
     def call():
-        return json.loads(client.models.generate_content(
+        raw = client.models.generate_content(
             model=MODEL_NAME, contents=prompt,
-            config=genai.types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
-        ).text)
+            config=genai.types.GenerateContentConfig(
+                temperature=0.2,
+                response_mime_type="application/json",
+                max_output_tokens=8192,   # prevents cut-off / unterminated strings
+            )
+        ).text
+        result = parse_json_robust(raw)
+        if result is None:
+            raise ValueError(f"Could not parse Gemini JSON response: {raw[:200]}")
+        return result
 
     for attempt in range(5):
         try:
@@ -448,6 +487,10 @@ Return ONLY valid JSON:
                 m = re.search(r"retryDelay.*?(\d+)s", err)
                 wait = max(int(m.group(1)) + 5 if m else 0, 65 * (2 ** attempt))
                 time.sleep(wait)
+            elif "Could not parse" in err and attempt < 4:
+                # Bad JSON — retry once with a smaller prompt (fewer snippets)
+                time.sleep(2)
+                continue
             else:
                 return {cat: {"has_service": False, "confidence": 0.0, "evidence": [], "notes": f"Model error: {e}"} for cat in categories}
 
