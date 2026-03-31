@@ -641,6 +641,10 @@ def classify_batch_parallel(url_rows, ws, wb, categories, category_positions,
         progress.progress((i + 1) / total)
         log_box.dataframe(pd.DataFrame(timing_log), use_container_width=True, height=300)
 
+        # Pace Gemini calls — 4s gap prevents per-minute rate limit hits
+        if i < total - 1 and not _daily_quota_exhausted:
+            time.sleep(4)
+
     return all_results, low_quality
 
 # ============================= UI =============================
