@@ -70,7 +70,7 @@ REQUEST_TIMEOUT = 10.0
 MAX_TEXT_PER_PAGE_CHARS = 15000
 TOP_SNIPPETS_PER_CATEGORY = 3  # reduced from 6 — fewer snippets = smaller output = no truncation
 THRESHOLD_DEFAULT = 0.6
-MAX_PARALLEL_COMPANIES_DEFAULT = 4
+MAX_PARALLEL_COMPANIES_DEFAULT = 6
 
 CACHE_DIR = Path(os.path.expanduser("~")) / ".crosstree_cache"
 CACHE_TTL_HOURS = 24
@@ -227,6 +227,30 @@ def fetch_html_with_ua_rotation(url):
 
     return None, None, last_err or "All attempts failed"
 
+def fetch_ddg_search(domain):
+    """
+    Search DuckDuckGo for site:domain to get rendered text that JS sites hide.
+    Returns (text, None) or (None, error).
+    """
+    query = f"site:{domain} services capabilities solutions consulting"
+    search_url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    try:
+        headers = dict(BROWSER_HEADERS)
+        headers["User-Agent"] = _USER_AGENTS[2]
+        with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers, follow_redirects=True) as s:
+            r = s.get(search_url)
+            r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        snippets = []
+        for result in soup.select(".result__snippet, .result__body"):
+            t = result.get_text(" ", strip=True)
+            if t and domain.split(".")[0].lower() in r.text.lower():
+                snippets.append(t)
+        text = " ".join(snippets[:10])
+        return (text, None) if len(text) > 100 else (None, "DDG: no relevant snippets")
+    except Exception as e:
+        return None, f"DDG search failed: {e}"
+
 def fetch_google_cache(url):
     cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{quote_plus(url)}&hl=en"
     try:
@@ -365,7 +389,14 @@ def crawl_site(start_url, max_pages=10):
 
         time.sleep(random.uniform(0.2, 0.6))
 
-    # Last resort: Google/Bing cache
+    # Layer 2: DDG search — gets rendered content for JS/SPA sites
+    if len(pages) < 3:
+        domain = urlparse(start_url).netloc.lstrip("www.")
+        ddg_text, ddg_err = fetch_ddg_search(domain)
+        if ddg_text:
+            pages.append({"url": f"[DDG Search] {domain}", "text": ddg_text[:MAX_TEXT_PER_PAGE_CHARS]})
+
+    # Layer 3: Google/Bing cache
     if len(pages) == 0:
         for target in [start_url] + [base + p for p in FALLBACK_PATHS[:4]]:
             if len(pages) >= max(3, max_pages // 4):
@@ -574,7 +605,7 @@ def classify_batch_parallel(url_rows, ws, wb, categories, category_positions,
                 _, url_val = url_rows[i]
                 pages, err, from_cache = [], str(e), False
             crawl_results[url_val] = (pages, err, from_cache)
-            timing_log[i]["status"] = "🕸️ crawled" if not err else "❌ crawl error"
+            timing_log[i]["status"] = "🕸️ crawled" if not err else f"❌ {err[:60]}"
             timing_log[i]["pages"] = len(pages)
             timing_log[i]["source"] = "cache" if from_cache else "fresh"
             log_box.dataframe(pd.DataFrame(timing_log), use_container_width=True, height=300)
@@ -641,9 +672,9 @@ def classify_batch_parallel(url_rows, ws, wb, categories, category_positions,
         progress.progress((i + 1) / total)
         log_box.dataframe(pd.DataFrame(timing_log), use_container_width=True, height=300)
 
-        # Pace Gemini calls — 4s gap prevents per-minute rate limit hits
+        # Small gap between calls — 2s is enough for paid-tier rate limits
         if i < total - 1 and not _daily_quota_exhausted:
-            time.sleep(4)
+            time.sleep(2)
 
     return all_results, low_quality
 
