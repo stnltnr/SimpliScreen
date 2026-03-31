@@ -65,8 +65,8 @@ BROWSER_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-MAX_PAGES_DEFAULT = 40
-REQUEST_TIMEOUT = 20.0
+MAX_PAGES_DEFAULT = 20
+REQUEST_TIMEOUT = 10.0
 MAX_TEXT_PER_PAGE_CHARS = 15000
 TOP_SNIPPETS_PER_CATEGORY = 3  # reduced from 6 — fewer snippets = smaller output = no truncation
 THRESHOLD_DEFAULT = 0.6
@@ -275,6 +275,35 @@ def get_links(html, base_url):
             links.append(absu.split("#")[0])
     return list(dict.fromkeys(links))
 
+def get_links_from_js(html, base_url):
+    """Extract paths mentioned in JavaScript (href='...', to='...', url:'...')."""
+    links = []
+    base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+    # Find quoted paths like '/services' or "/about-us" in JS
+    for m in re.finditer(r'["\'](\/([\w\-/]+))["\']', html):
+        path = m.group(1)
+        if any(kw in path.lower() for kw in PRIORITY_PATH_KEYWORDS):
+            full = base + path
+            if is_http_url(full):
+                links.append(full)
+    return list(dict.fromkeys(links))[:20]
+
+def fetch_sitemap(base_url):
+    """Try to get URLs from sitemap.xml or sitemap_index.xml."""
+    base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+    urls = []
+    for path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap"]:
+        try:
+            html, _, err = fetch_html_with_ua_rotation(base + path)
+            if html and "<url>" in html.lower():
+                found = re.findall(r"<loc>\s*(https?://[^\s<]+)\s*</loc>", html)
+                same = [u for u in found if same_domain(u, base_url)]
+                urls.extend(same[:40])
+                break
+        except Exception:
+            pass
+    return urls
+
 def crawl_site(start_url, max_pages=10):
     start_url = clean_url(start_url)
     cached = cache_load(start_url)
@@ -285,9 +314,17 @@ def crawl_site(start_url, max_pages=10):
     pages = []
     errors = []
     base_domain = urlparse(start_url).netloc
+    base = f"{urlparse(start_url).scheme}://{base_domain}"
 
-    # Priority-sorted queue: (negative_score, url)
-    queue = [(-url_priority_score(start_url), start_url)]
+    # Always pre-seed queue with high-value subpages (handles JS-heavy SPAs)
+    priority_seeds = [start_url] + [base + p for p in FALLBACK_PATHS]
+    queue = [(-url_priority_score(u), u) for u in priority_seeds]
+
+    # Also try sitemap for more URLs
+    sitemap_urls = fetch_sitemap(start_url)
+    for u in sitemap_urls:
+        if u not in visited:
+            queue.append((-url_priority_score(u), u))
 
     while queue and len(pages) < max_pages:
         queue.sort(key=lambda x: x[0])
@@ -300,21 +337,10 @@ def crawl_site(start_url, max_pages=10):
         html, final_url, err = fetch_html_with_ua_rotation(url)
 
         if html is None:
-            is_homepage = (url == start_url)
-            is_block = err and ("HTTP 403" in err or "HTTP 429" in err or "HTTP 401" in err)
-            is_gone = err and ("HTTP 404" in err or "HTTP 410" in err)
-
-            if is_homepage and (is_block or is_gone or "ConnectError" in str(err)):
-                # Try known subpages as fallback
-                base = f"{urlparse(start_url).scheme}://{base_domain}"
-                for path in FALLBACK_PATHS:
-                    fb = base + path
-                    if fb not in visited:
-                        queue.append((-url_priority_score(fb), fb))
             errors.append(f"{err}: {url}")
             continue
 
-        # If redirect landed on a different domain, update base for link-following
+        # Update base domain if redirect landed elsewhere
         if final_url:
             final_domain = urlparse(final_url).netloc
             if final_domain and final_domain != base_domain:
@@ -327,23 +353,25 @@ def crawl_site(start_url, max_pages=10):
         pages.append({"url": final_url or url, "text": text[:MAX_TEXT_PER_PAGE_CHARS]})
 
         if len(pages) < max_pages:
-            for link in get_links(html, final_url or url)[:30]:
+            effective_url = final_url or url
+            # Standard HTML links
+            for link in get_links(html, effective_url)[:30]:
+                if link not in visited:
+                    queue.append((-url_priority_score(link), link))
+            # JS-embedded paths (for SPAs / React sites)
+            for link in get_links_from_js(html, effective_url):
                 if link not in visited:
                     queue.append((-url_priority_score(link), link))
 
-        time.sleep(random.uniform(0.3, 1.0))
+        time.sleep(random.uniform(0.2, 0.6))
 
-    # Cache fallbacks when live crawl yielded nothing
+    # Last resort: Google/Bing cache
     if len(pages) == 0:
-        targets = [start_url] + [
-            f"{urlparse(start_url).scheme}://{urlparse(start_url).netloc}{p}"
-            for p in FALLBACK_PATHS[:5]
-        ]
-        for target in targets:
+        for target in [start_url] + [base + p for p in FALLBACK_PATHS[:4]]:
             if len(pages) >= max(3, max_pages // 4):
                 break
             for fetch_fn, label in [(fetch_google_cache, "Google Cache"), (fetch_bing_cache, "Bing Cache")]:
-                html, err = fetch_fn(target)
+                html, _ = fetch_fn(target)
                 if html:
                     text = extract_text(html, target)
                     if text.strip():
