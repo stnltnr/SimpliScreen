@@ -1,0 +1,8 @@
+streamlit
+httpx
+trafilatura
+beautifulsoup4
+openpyxl
+google-genai
+pandas
+lxml

@@ -1,0 +1,6 @@
+# Never commit secrets or cache to GitHub
+.streamlit/secrets.toml
+.crosstree_cache/
+__pycache__/
+*.pyc
+.env
