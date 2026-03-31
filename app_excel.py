@@ -179,53 +179,45 @@ def url_priority_score(url):
     score -= path.count("/") * 2
     return score
 
-def _fetch_one(url, ua_index=0, verify=True):
-    headers = dict(BROWSER_HEADERS)
-    headers["User-Agent"] = _USER_AGENTS[ua_index % len(_USER_AGENTS)]
-    with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers,
-                      follow_redirects=True, verify=verify) as s:
-        r = s.get(url)
-        r.raise_for_status()
-        return r.text, str(r.url)  # return final URL after redirects
-
-def fetch_html_with_ua_rotation(url):
-    """Try multiple UAs. Falls back to SSL-disabled and HTTP scheme on failure."""
-    last_err = None
-    parsed = urlparse(url)
-
-    # Build candidate URLs: original, then http:// variant
-    candidates = [url]
-    if parsed.scheme == "https":
-        candidates.append("http://" + url[8:])
-
-    for candidate in candidates:
-        for i in range(len(_USER_AGENTS)):
-            try:
-                html, final_url = _fetch_one(candidate, ua_index=i)
-                return html, final_url, None
-            except httpx.HTTPStatusError as e:
-                code = e.response.status_code
-                if code in (404, 410):
-                    return None, None, f"HTTP {code}"
-                last_err = f"HTTP {code}"
-                time.sleep(random.uniform(0.5, 1.5))
-            except httpx.ConnectError as e:
-                err_str = str(e)
-                # SSL error — retry without verification
-                if "SSL" in err_str or "certificate" in err_str.lower():
-                    try:
-                        html, final_url = _fetch_one(candidate, ua_index=i, verify=False)
-                        return html, final_url, None
-                    except Exception as e2:
-                        last_err = f"SSL error (verify=False also failed): {e2}"
-                else:
-                    return None, None, f"ConnectError: {e}"
-            except httpx.TimeoutException:
-                last_err = "Timeout"
-            except Exception as e:
-                last_err = str(e)
-
-    return None, None, last_err or "All attempts failed"
+def fetch_page(url):
+    """
+    Fetch a single URL. Tries 2 UAs max. SSL fallback on cert errors.
+    Returns (html, final_url, error).
+    """
+    for ua_idx in range(2):  # max 2 UA attempts — not 5
+        headers = dict(BROWSER_HEADERS)
+        headers["User-Agent"] = _USER_AGENTS[ua_idx]
+        try:
+            with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers,
+                              follow_redirects=True, verify=True) as s:
+                r = s.get(url)
+                r.raise_for_status()
+                return r.text, str(r.url), None
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code
+            if code in (404, 410):
+                return None, None, f"HTTP {code}"
+            if ua_idx == 1:
+                return None, None, f"HTTP {code}"
+            time.sleep(0.5)
+        except httpx.ConnectError as e:
+            err_str = str(e)
+            if "SSL" in err_str or "certificate" in err_str.lower():
+                # One SSL-disabled retry
+                try:
+                    with httpx.Client(timeout=REQUEST_TIMEOUT, headers=headers,
+                                      follow_redirects=True, verify=False) as s:
+                        r = s.get(url)
+                        r.raise_for_status()
+                        return r.text, str(r.url), None
+                except Exception:
+                    pass
+            return None, None, f"ConnectError"
+        except httpx.TimeoutException:
+            return None, None, "Timeout"
+        except Exception as e:
+            return None, None, str(e)[:80]
+    return None, None, "Failed after 2 attempts"
 
 def fetch_ddg_search(domain):
     """
@@ -299,36 +291,15 @@ def get_links(html, base_url):
             links.append(absu.split("#")[0])
     return list(dict.fromkeys(links))
 
-def get_links_from_js(html, base_url):
-    """Extract paths mentioned in JavaScript (href='...', to='...', url:'...')."""
-    links = []
-    base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-    # Find quoted paths like '/services' or "/about-us" in JS
-    for m in re.finditer(r'["\'](\/([\w\-/]+))["\']', html):
-        path = m.group(1)
-        if any(kw in path.lower() for kw in PRIORITY_PATH_KEYWORDS):
-            full = base + path
-            if is_http_url(full):
-                links.append(full)
-    return list(dict.fromkeys(links))[:20]
-
-def fetch_sitemap(base_url):
-    """Try to get URLs from sitemap.xml or sitemap_index.xml."""
-    base = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-    urls = []
-    for path in ["/sitemap.xml", "/sitemap_index.xml", "/sitemap"]:
-        try:
-            html, _, err = fetch_html_with_ua_rotation(base + path)
-            if html and "<url>" in html.lower():
-                found = re.findall(r"<loc>\s*(https?://[^\s<]+)\s*</loc>", html)
-                same = [u for u in found if same_domain(u, base_url)]
-                urls.extend(same[:40])
-                break
-        except Exception:
-            pass
-    return urls
-
 def crawl_site(start_url, max_pages=10):
+    """
+    Fast, bounded crawl with hard limits:
+    1. Fetch homepage + top 4 priority subpages directly (max 5 seeds)
+    2. Discover links from homepage and follow up to max_pages total
+    3. Always run DDG search to supplement (especially for JS/SPA sites)
+    4. Google/Bing cache as final fallback if 0 pages
+    Total time bounded: max_pages × REQUEST_TIMEOUT = ~100s worst case
+    """
     start_url = clean_url(start_url)
     cached = cache_load(start_url)
     if cached is not None:
@@ -340,15 +311,9 @@ def crawl_site(start_url, max_pages=10):
     base_domain = urlparse(start_url).netloc
     base = f"{urlparse(start_url).scheme}://{base_domain}"
 
-    # Always pre-seed queue with high-value subpages (handles JS-heavy SPAs)
-    priority_seeds = [start_url] + [base + p for p in FALLBACK_PATHS]
-    queue = [(-url_priority_score(u), u) for u in priority_seeds]
-
-    # Also try sitemap for more URLs
-    sitemap_urls = fetch_sitemap(start_url)
-    for u in sitemap_urls:
-        if u not in visited:
-            queue.append((-url_priority_score(u), u))
+    # Seed: homepage + top 4 most useful subpages only
+    top_seeds = [start_url] + [base + p for p in FALLBACK_PATHS[:4]]
+    queue = [(-url_priority_score(u), u) for u in top_seeds]
 
     while queue and len(pages) < max_pages:
         queue.sort(key=lambda x: x[0])
@@ -358,17 +323,17 @@ def crawl_site(start_url, max_pages=10):
             continue
         visited.add(url)
 
-        html, final_url, err = fetch_html_with_ua_rotation(url)
+        html, final_url, err = fetch_page(url)
 
         if html is None:
-            errors.append(f"{err}: {url}")
+            errors.append(f"{err}: {urlparse(url).path or '/'}")
             continue
 
-        # Update base domain if redirect landed elsewhere
+        # Track redirect to new domain
         if final_url:
-            final_domain = urlparse(final_url).netloc
-            if final_domain and final_domain != base_domain:
-                base_domain = final_domain
+            fd = urlparse(final_url).netloc
+            if fd and fd != base_domain:
+                base_domain = fd
 
         text = extract_text(html, final_url or url)
         if not text.strip():
@@ -376,41 +341,36 @@ def crawl_site(start_url, max_pages=10):
 
         pages.append({"url": final_url or url, "text": text[:MAX_TEXT_PER_PAGE_CHARS]})
 
-        if len(pages) < max_pages:
-            effective_url = final_url or url
-            # Standard HTML links
-            for link in get_links(html, effective_url)[:30]:
-                if link not in visited:
-                    queue.append((-url_priority_score(link), link))
-            # JS-embedded paths (for SPAs / React sites)
-            for link in get_links_from_js(html, effective_url):
+        # Only discover more links from homepage (first page)
+        if len(pages) == 1 and len(pages) < max_pages:
+            for link in get_links(html, final_url or url)[:20]:
                 if link not in visited:
                     queue.append((-url_priority_score(link), link))
 
-        time.sleep(random.uniform(0.2, 0.6))
+        time.sleep(random.uniform(0.15, 0.4))
 
-    # Layer 2: DDG search — gets rendered content for JS/SPA sites
-    if len(pages) < 3:
-        domain = urlparse(start_url).netloc.lstrip("www.")
-        ddg_text, ddg_err = fetch_ddg_search(domain)
-        if ddg_text:
-            pages.append({"url": f"[DDG Search] {domain}", "text": ddg_text[:MAX_TEXT_PER_PAGE_CHARS]})
+    # Always supplement with DDG — gets rendered JS content + indexed descriptions
+    domain = urlparse(start_url).netloc.lstrip("www.")
+    ddg_text, _ = fetch_ddg_search(domain)
+    if ddg_text:
+        pages.append({"url": f"[DDG] {domain}", "text": ddg_text[:MAX_TEXT_PER_PAGE_CHARS]})
 
-    # Layer 3: Google/Bing cache
+    # Last resort: Google/Bing cache
     if len(pages) == 0:
-        for target in [start_url] + [base + p for p in FALLBACK_PATHS[:4]]:
-            if len(pages) >= max(3, max_pages // 4):
+        for target in [start_url] + [base + p for p in FALLBACK_PATHS[:3]]:
+            if len(pages) >= 2:
                 break
             for fetch_fn, label in [(fetch_google_cache, "Google Cache"), (fetch_bing_cache, "Bing Cache")]:
                 html, _ = fetch_fn(target)
                 if html:
                     text = extract_text(html, target)
                     if text.strip():
-                        pages.append({"url": f"[{label}] {target}", "text": text[:MAX_TEXT_PER_PAGE_CHARS]})
+                        pages.append({"url": f"[{label}] {target}",
+                                      "text": text[:MAX_TEXT_PER_PAGE_CHARS]})
                         break
 
     if len(pages) == 0:
-        reason = "; ".join(errors[:3]) if errors else "unknown"
+        reason = "; ".join(errors[:2]) if errors else "unknown"
         return [], f"All crawl methods failed: {reason}", False
 
     cache_save(start_url, pages)
@@ -599,7 +559,12 @@ def classify_batch_parallel(url_rows, ws, wb, categories, category_positions,
         }
         for future in as_completed(futures):
             try:
-                i, url_val, (pages, err, from_cache) = future.result()
+                # Hard 60s timeout per company — never hang indefinitely
+                i, url_val, (pages, err, from_cache) = future.result(timeout=60)
+            except TimeoutError:
+                i = futures[future]
+                _, url_val = url_rows[i]
+                pages, err, from_cache = [], "Crawl timeout (60s)", False
             except Exception as e:
                 i = futures[future]
                 _, url_val = url_rows[i]
