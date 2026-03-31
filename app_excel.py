@@ -265,6 +265,28 @@ def fetch_ddg_search(domain, company_name=""):
     combined = " ".join(all_text)
     return (combined[:MAX_TEXT_PER_PAGE_CHARS], None) if len(combined) > 100 else (None, "DDG: no results")
 
+def fetch_wayback(url: str) -> tuple:
+    """
+    Fetch the most recent Wayback Machine snapshot of a URL.
+    Returns (html, None) or (None, error).
+    """
+    api = f"https://archive.org/wayback/available?url={quote_plus(url)}"
+    try:
+        with httpx.Client(timeout=10, headers=BROWSER_HEADERS, follow_redirects=True) as s:
+            data = s.get(api).json()
+        snapshot_url = (data.get("archived_snapshots", {})
+                            .get("closest", {})
+                            .get("url"))
+        if not snapshot_url:
+            return None, "No Wayback snapshot"
+        with httpx.Client(timeout=REQUEST_TIMEOUT, headers=BROWSER_HEADERS,
+                          follow_redirects=True) as s:
+            r = s.get(snapshot_url)
+            r.raise_for_status()
+        return r.text, None
+    except Exception as e:
+        return None, str(e)
+
 def fetch_google_cache(url):
     cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{quote_plus(url)}&hl=en"
     try:
@@ -371,13 +393,29 @@ def crawl_site(start_url, max_pages=10, company_name=""):
 
         time.sleep(random.uniform(0.15, 0.4))
 
-    # Always supplement with DDG (3 queries) — gets rendered JS content
+    # Filter out garbage/binary pages from live crawl
+    pages = [p for p in pages if is_readable(p["text"])]
+
+    # Layer 2: DDG (3 targeted queries) — gets rendered JS + indexed content
     domain = urlparse(start_url).netloc.lstrip("www.")
     ddg_text, _ = fetch_ddg_search(domain, company_name=company_name)
-    if ddg_text:
+    if ddg_text and is_readable(ddg_text):
         pages.append({"url": f"[DDG] {domain}", "text": ddg_text[:MAX_TEXT_PER_PAGE_CHARS]})
 
-    # Last resort: Google/Bing cache
+    # Layer 3: Wayback Machine for key subpages (great for JS sites)
+    if len(pages) < 3:
+        wb_targets = [start_url] + [base + p for p in FALLBACK_PATHS[:3]]
+        for target in wb_targets:
+            if len(pages) >= 5:
+                break
+            html, err = fetch_wayback(target)
+            if html:
+                text = extract_text(html, target)
+                if text and is_readable(text):
+                    pages.append({"url": f"[Wayback] {target}",
+                                  "text": text[:MAX_TEXT_PER_PAGE_CHARS]})
+
+    # Layer 4: Google/Bing cache (last resort)
     if len(pages) == 0:
         for target in [start_url] + [base + p for p in FALLBACK_PATHS[:3]]:
             if len(pages) >= 2:
@@ -386,7 +424,7 @@ def crawl_site(start_url, max_pages=10, company_name=""):
                 html, _ = fetch_fn(target)
                 if html:
                     text = extract_text(html, target)
-                    if text.strip():
+                    if text and is_readable(text):
                         pages.append({"url": f"[{label}] {target}",
                                       "text": text[:MAX_TEXT_PER_PAGE_CHARS]})
                         break
@@ -415,10 +453,23 @@ def clean_for_prompt(text):
     """Strip binary/non-printable characters that cause 'unreadable evidence' in Gemini."""
     if not isinstance(text, str):
         return ""
-    # Keep only printable ASCII + common unicode letters — removes binary garbage
     text = "".join(c if (ord(c) >= 32 and ord(c) != 127) or c in "\t" else " " for c in text)
     text = text.replace("\\", " ").replace('"', "'")
     return re.sub(r"\s+", " ", text).strip()
+
+def is_readable(text: str, min_word_ratio: float = 0.55) -> bool:
+    """
+    Return True if text looks like real prose, False if it's binary/garbage.
+    Checks that at least min_word_ratio of whitespace-separated tokens are
+    plausible English words (2-25 alpha chars).
+    """
+    if not text or len(text) < 60:
+        return False
+    tokens = text.split()
+    if len(tokens) < 8:
+        return False
+    real = sum(1 for t in tokens if 2 <= len(re.sub(r"[^a-zA-Z]", "", t)) <= 25)
+    return (real / len(tokens)) >= min_word_ratio
 
 def parse_json_robust(raw):
     """Try JSON parse with 4-stage progressive repair."""
@@ -455,9 +506,10 @@ def build_snippets(pages):
     snippets = []
     for p in pages:
         for ch in chunk_text(p["text"]):
-            if len(ch) >= 200:
-                snippets.append({"url": p["url"], "text": clean_for_prompt(ch)})
-    return snippets[:300]  # reduced from 500 to keep prompts manageable
+            cleaned = clean_for_prompt(ch)
+            if len(cleaned) >= 200 and is_readable(cleaned):
+                snippets.append({"url": p["url"], "text": cleaned})
+    return snippets[:300]
 
 def rank_snippets_for_category(snippets, category):
     terms = re.findall(r"[a-z0-9]+", category.lower())
@@ -625,7 +677,7 @@ def classify_batch_parallel(url_rows, ws, wb, categories, category_positions,
     for i, (row_idx, url_val) in enumerate(url_rows):
         if _daily_quota_exhausted:
             for cat in categories:
-                ws.cell(row=row_idx, column=category_positions[cat]).value = ""
+                ws.cell(row=row_idx, column=category_positions[cat]).value = 0  # 0 not blank
             timing_log[i]["status"] = "🚫 quota abort"
             log_box.dataframe(pd.DataFrame(timing_log), use_container_width=True, height=300)
             continue
